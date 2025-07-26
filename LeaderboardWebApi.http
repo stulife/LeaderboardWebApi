@@ -1,0 +1,33 @@
+@LeaderboardWebApi_HostAddress = http://localhost:5162
+
+GET {{LeaderboardWebApi_HostAddress}}/Monitoring/health/
+Accept: application/json
+
+###
+
+
+GET {{LeaderboardWebApi_HostAddress}}/monitoring/metrics
+Accept: application/json
+
+###
+# @name updateScore
+POST {{LeaderboardWebApi_HostAddress}}/customer/15514665/score/124
+Accept: application/json
+
+###
+
+POST {{LeaderboardWebApi_HostAddress}}/customer/81546541/score/113
+Accept: application/json
+
+###
+
+# @name Get customer by rank
+GET {{LeaderboardWebApi_HostAddress}}/leaderboard?start=1&end=10
+Accept: application/json
+
+###
+# @name Get customer by customerid
+GET {{LeaderboardWebApi_HostAddress}}/leaderboard/15514665?high=2&low=3
+Accept: application/json
+
+###

@@ -1,0 +1,17 @@
+# 构建输出
+[Bb]in/
+[Oo]bj/
+
+# .NET Core 发布输出
+publish/
+*.pdb
+*.dll
+*.exe
+*.xml
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json

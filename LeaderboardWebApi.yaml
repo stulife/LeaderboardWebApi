@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: leaderboard-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: leaderboard
+  template:
+    metadata:
+      labels:
+        app: leaderboard
+    spec:
+      containers:
+      - name: leaderboard
+        image: your-registry/leaderboard-service:latest
+        ports:
+        - containerPort: 80
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: leaderboard-service
+spec:
+  selector:
+    app: leaderboard
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
