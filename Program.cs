@@ -7,6 +7,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 builder.Services.AddSingleton<ILeaderboardService, LeaderboardService>();
+builder.Services.AddSingleton<DataInitializer>();
 builder.Services.AddControllers();
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
@@ -28,6 +29,26 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI(c=>{  c.SwaggerEndpoint("/swagger/v1/swagger.json", "Leaderboard API v1");
         c.RoutePrefix = "swagger";});
+}
+
+
+// Initialized Data
+try
+{
+    var dataInitializer = app.Services.GetRequiredService<DataInitializer>();
+    dataInitializer.Initialize();
+    
+    var logger = app.Services.GetRequiredService<ILogger<Program>>();
+    var metrics = app.Services
+        .GetRequiredService<ILeaderboardService>()
+        .GetMetrics();
+    
+    logger.LogInformation("Application started with {Total} customers, {Leaderboard} in leaderboard",
+        metrics.TotalCustomers, metrics.LeaderboardCustomers);
+}
+catch (Exception ex)
+{
+    app.Logger.LogError(ex, "Error during data initialization");
 }
 
 app.UseHttpsRedirection();
