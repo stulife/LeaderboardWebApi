@@ -1,20 +1,21 @@
 using System.Collections.Concurrent;
-using System.Collections.Immutable;
+
 using LeaderboardWebApi.Models;
+using LeaderboardWebApi.Utilities;
 
 namespace LeaderboardWebApi.Services;
 
 
 public class LeaderboardService : ILeaderboardService
 {
+    private readonly SkipList<CustomerScore> _leaderboard = new();
     private readonly ConcurrentDictionary<long, decimal> _scores = new();
-
-    private ImmutableSortedSet<(decimal Score, long CustomerId)> _leaderboard =
-    ImmutableSortedSet.Create<(decimal Score, long CustomerId)>(
-        Comparer<(decimal Score, long CustomerId)>.Create((x, y) =>
-            x.Score != y.Score ? y.Score.CompareTo(x.Score) :
-            x.CustomerId.CompareTo(y.CustomerId)));
-
+    private readonly Dictionary<long, int> _rankCache = new();
+    private readonly List<CustomerScore> _topRankCache = new();
+    private long _cacheVersion;
+    private long _topCacheVersion;
+    private const int TopRankCacheSize = 10;
+    private readonly ReaderWriterLockSlim _lock = new();
     private readonly ILogger<LeaderboardService> _logger;
 
     public LeaderboardService(ILogger<LeaderboardService> logger)
@@ -23,119 +24,318 @@ public class LeaderboardService : ILeaderboardService
     }
     public void InitializeFromSeed(IEnumerable<(long CustomerId, decimal Score)> seedData)
     {
-        foreach (var (customerId, score) in seedData)
+        _lock.EnterWriteLock();
+        try
         {
-            _scores[customerId] = score;
-            if (score > 0)
-            {
-                _leaderboard = _leaderboard.Add((score, customerId));
-            }
-        }
-        _logger.LogInformation("Initialized leaderboard with {Count} customers", seedData.Count());
+            // Clear existing data
+            _scores.Clear();
+            _rankCache.Clear();
+            _topRankCache.Clear();
+            Interlocked.Exchange(ref _cacheVersion, 0);
+            Interlocked.Exchange(ref _topCacheVersion, 0);
 
+            // Bulk load scores
+            var scoreDict = new Dictionary<long, decimal>();
+            var leaderboardItems = new List<CustomerScore>();
+
+            foreach (var (customerId, score) in seedData)
+            {
+                scoreDict[customerId] = score;
+                if (score > 0)
+                {
+                    leaderboardItems.Add(new CustomerScore(customerId, score));
+                }
+            }
+
+            // Sort for efficient bulk insertion (descending score, ascending customer ID)
+            leaderboardItems.Sort((a, b) =>
+                a.Score != b.Score ? b.Score.CompareTo(a.Score) :
+                a.CustomerId.CompareTo(b.CustomerId));
+
+            // Add items to skip list and capture ranks
+            foreach (var item in leaderboardItems)
+            {
+                var (success, rank) = _leaderboard.Add(item);
+                if (success)
+                {
+                    _rankCache[item.CustomerId] = rank;
+                }
+            }
+
+            // Update scores dictionary
+            foreach (var kvp in scoreDict)
+            {
+                _scores[kvp.Key] = kvp.Value;
+            }
+
+            // Prebuild top rank cache
+            _topRankCache.AddRange(_leaderboard.GetByRankRange(1, Math.Min(TopRankCacheSize, leaderboardItems.Count)));
+
+            // Set cache versions
+            Interlocked.Exchange(ref _cacheVersion, 1);
+            Interlocked.Exchange(ref _topCacheVersion, 1);
+            _logger.LogInformation("Initialized leaderboard with {Count} customers", seedData.Count());
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
     }
+
+
     public decimal UpdateScore(long customerId, decimal scoreChange)
     {
         if (scoreChange < -1000 || scoreChange > 1000)
             throw new ArgumentOutOfRangeException(nameof(scoreChange),
-                "Score change must be between -1000 and 1000");
+                "Score must be between -1000 and 1000");
 
-        _scores.TryGetValue(customerId, out decimal currentScore);
-        decimal newScore = currentScore + scoreChange;
+        _lock.EnterWriteLock();
+        try
+        {
+            // Get current score
+            _scores.TryGetValue(customerId, out decimal currentScore);
+            decimal newScore = currentScore + scoreChange;
+            _scores[customerId] = newScore;
 
-        _scores[customerId] = newScore;
+            // Prepare score objects
+            var oldScoreObj = new CustomerScore(customerId, currentScore);
+            var newScoreObj = new CustomerScore(customerId, newScore);
 
-        if (currentScore > 0)
-            _leaderboard = _leaderboard.Remove((currentScore, customerId));
+            // Update skip list
+            if (currentScore > 0)
+            {
+                var (removed, oldRank) = _leaderboard.Remove(oldScoreObj);
+                if (removed) InvalidateCaches(oldRank, customerId);
+            }
 
-        if (newScore > 0)
-            _leaderboard = _leaderboard.Add((newScore, customerId));
+            if (newScore > 0)
+            {
+                var (added, newRank) = _leaderboard.Add(newScoreObj);
+                if (added) InvalidateCaches(newRank, customerId);
+            }
 
-        return newScore;
+            return newScore;
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+
+    private void InvalidateCaches(int affectedRank, long customerId)
+    {
+        _rankCache.Remove(customerId);
+        _topRankCache.RemoveAll(x => x.CustomerId == customerId);
+        Interlocked.Increment(ref _cacheVersion);
+        Interlocked.Increment(ref _topCacheVersion);
 
     }
 
     public List<CustomerRanking> GetByRank(int start, int end)
     {
-        if (start < 1) throw new ArgumentOutOfRangeException(nameof(start), "Start rank must be at least 1");
-        if (end < start) throw new ArgumentOutOfRangeException(nameof(end), "End rank cannot be less than start");
+        if (start < 1 || end < start)
+            throw new ArgumentException("Invalid rank range");
 
-        var results = new List<CustomerRanking>();
-        int currentRank = 1;
+        // Use top cache if possible
+        if (start == 1 && end <= TopRankCacheSize)
+            return GetTopRanksFromCache(end);
 
-        foreach (var entry in _leaderboard)
+        _lock.EnterReadLock();
+        try
         {
-            if (currentRank > end) break;
-            if (currentRank >= start)
+            var results = new List<CustomerRanking>();
+            int index = 0;
+
+            // Directly iterate through required ranks
+            foreach (var score in _leaderboard.GetByRankRange(start, end))
+            {
                 results.Add(new CustomerRanking
                 {
-                    CustomerId = entry.CustomerId,
-                    Score = entry.Score,
-                    Rank = currentRank
+                    CustomerId = score.CustomerId,
+                    Score = score.Score,
+                    Rank = start + index++
                 });
-
-            currentRank++;
+            }
+            return results;
         }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+    }
 
+    private List<CustomerRanking> GetTopRanksFromCache(int count)
+    {
+        long currentVersion = Interlocked.Read(ref _topCacheVersion);
+
+        // Use cache if valid
+        if (_topRankCache.Count >= count && currentVersion == _topCacheVersion)
+            return BuildRankings(_topRankCache, count);
+        // Rebuild cache
+        _lock.EnterWriteLock();
+        try
+        {
+            long newVersion = Interlocked.Read(ref _topCacheVersion);
+            if (_topRankCache.Count >= count && newVersion == currentVersion)
+                return BuildRankings(_topRankCache, count);
+
+            _topRankCache.Clear();
+            var topItems = _leaderboard.GetByRankRange(1, TopRankCacheSize);
+            _topRankCache.AddRange(topItems);
+            return BuildRankings(_topRankCache, count);
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+
+    private List<CustomerRanking> BuildRankings(List<CustomerScore> scores, int count)
+    {
+        var results = new List<CustomerRanking>();
+        for (int i = 0; i < Math.Min(count, scores.Count); i++)
+        {
+            results.Add(new CustomerRanking
+            {
+                CustomerId = scores[i].CustomerId,
+                Score = scores[i].Score,
+                Rank = i + 1
+            });
+        }
         return results;
     }
 
     public List<CustomerRanking> GetWithNeighbors(long customerId, int high, int low)
     {
-        if (high < 0) throw new ArgumentOutOfRangeException(nameof(high), "High neighbor count cannot be negative");
-        if (low < 0) throw new ArgumentOutOfRangeException(nameof(low), "Low neighbor count cannot be negative");
+        if (high < 0 || low < 0)
+            throw new ArgumentException("Neighbor counts must be non-negative");
 
-        if (!_scores.TryGetValue(customerId, out decimal score) || score <= 0)
-            return new List<CustomerRanking>();
+        int? rank = GetCachedRank(customerId);
+        if (rank == null) return new List<CustomerRanking>();
 
-        int targetIndex = -1;
-        int currentIndex = 0;
-        foreach (var entry in _leaderboard)
+        int start = Math.Max(1, rank.Value - high);
+        int end = Math.Min(_leaderboard.Count, rank.Value + low);
+
+        return GetByRank(start, end);
+    }
+
+    private int? GetCachedRank(long customerId)
+    {
+        long currentVersion = Interlocked.Read(ref _cacheVersion);
+
+        // Check cache first 
+        if (_rankCache.TryGetValue(customerId, out int rank))
         {
-            if (entry.Score == score && entry.CustomerId == customerId)
+            // Validate cache entry is still valid
+            _lock.EnterReadLock();
+            try
             {
-                targetIndex = currentIndex;
-                break;
-            }
-            currentIndex++;
-        }
-
-        if (targetIndex == -1)
-            return new List<CustomerRanking>();
-
-        int startIndex = Math.Max(0, targetIndex - high);
-        int endIndex = Math.Min(_leaderboard.Count - 1, targetIndex + low);
-
-        var results = new List<CustomerRanking>();
-        int currentRank = 1;
-        int currentPos = 0;
-
-        foreach (var entry in _leaderboard)
-        {
-            if (currentPos > endIndex) break;
-            if (currentPos >= startIndex)
-                results.Add(new CustomerRanking
+                // Check if cache version has changed since we read it
+                if (currentVersion != Interlocked.Read(ref _cacheVersion))
                 {
-                    CustomerId = entry.CustomerId,
-                    Score = entry.Score,
-                    Rank = currentRank
-                });
+                    // Cache version has been updated, re-validate
+                    if (_rankCache.TryGetValue(customerId, out rank))
+                    {
+                        // Double-check that the customer's score is still valid
+                        if (_scores.TryGetValue(customerId, out decimal scoreValue) && scoreValue > 0)
+                        {
+                            return rank;
+                        }
+                        else
+                        {
+                            // Score is no longer valid, remove from cache
+                            _rankCache.Remove(customerId);
+                            return null;
+                        }
+                    }
+                    else
+                    {
+                        // Entry no longer exists in cache
+                        return null;
+                    }
+                }
 
-            currentRank++;
-            currentPos++;
+                // Cache version hasn't changed, validate score directly
+                if (!_scores.TryGetValue(customerId, out decimal score) || score <= 0)
+                {
+                    // Score is invalid, remove from cache
+                    _rankCache.Remove(customerId);
+                    return null;
+                }
+
+                return rank;
+            }
+            finally
+            {
+                _lock.ExitReadLock();
+            }
         }
 
-        return results;
+        // Rank not in cache, need to skipList look it up
+        _lock.EnterReadLock();
+        try
+        {
+            // Double-check cache version hasn't changed
+            long newVersion = Interlocked.Read(ref _cacheVersion);
+            if (newVersion != currentVersion)
+            {
+                // Version has changed, check if rank was added in the meantime
+                if (_rankCache.TryGetValue(customerId, out rank))
+                {
+                    // Verify score is still valid
+                    if (_scores.TryGetValue(customerId, out decimal scoreValue) && scoreValue > 0)
+                    {
+                        return rank;
+                    }
+                    else
+                    {
+                        _rankCache.Remove(customerId);
+                        return null;
+                    }
+                }
+            }
+
+            // Get customer's score from dictionary
+            if (!_scores.TryGetValue(customerId, out decimal score) || score <= 0)
+                return null;
+
+            // Get rank from leaderboard
+            var customerScore = new CustomerScore(customerId, score);
+            int? result = _leaderboard.GetRank(customerScore);
+
+            if (result.HasValue)
+            {
+                // Only cache the result if cache version hasn't changed
+                if (Interlocked.Read(ref _cacheVersion) == currentVersion)
+                {
+                    _rankCache[customerId] = result.Value;
+                }
+                return result.Value;
+            }
+            return null;
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
     }
 
     public ServiceMetrics GetMetrics()
     {
-        return new ServiceMetrics
+        _lock.EnterReadLock();
+        try
         {
-            TotalCustomers = _scores.Count,
-            LeaderboardCustomers = _leaderboard.Count,
-            TopScore = _leaderboard.Count > 0 ? _leaderboard.Max.Score : 0
-        };
-
+            return new ServiceMetrics
+            {
+                TotalCustomers = _scores.Count,
+                LeaderboardCustomers = _leaderboard.Count,
+                TopScore = _leaderboard.Count > 0 ?
+                    _leaderboard.GetByRankRange(1, 1).First().Score : 0
+            };
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
     }
 }

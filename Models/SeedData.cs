@@ -28,4 +28,16 @@ public static class SeedData
         (130000000, 5),
         (140000000, 1)
     };
+
+    // Static constructor to add 30,0000 random entries
+    static SeedData()
+    {
+        var random = new Random(42);
+        for (int i = 0; i < 300000; i++)
+        {
+            long customerId = 1000000000L + i; // Generate unique customer IDs
+            decimal score = random.Next(0, 1000); // Random score between 0-999
+            Customers.Add((customerId, score));
+        }
+    }
 }
