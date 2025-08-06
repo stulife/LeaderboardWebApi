@@ -235,85 +235,35 @@ public class LeaderboardService : ILeaderboardService
 
     private int? GetCachedRank(long customerId)
     {
-        long currentVersion = Interlocked.Read(ref _cacheVersion);
-
-        // Check cache first 
-        if (_rankCache.TryGetValue(customerId, out int rank))
+        _lock.EnterReadLock();  // Acquire read lock FIRST before accessing shared state
+        try
         {
-            // Validate cache entry is still valid
-            _lock.EnterReadLock();
-            try
-            {
-                // Check if cache version has changed since we read it
-                if (currentVersion != Interlocked.Read(ref _cacheVersion))
-                {
-                    // Cache version has been updated, re-validate
-                    if (_rankCache.TryGetValue(customerId, out rank))
-                    {
-                        // Double-check that the customer's score is still valid
-                        if (_scores.TryGetValue(customerId, out decimal scoreValue) && scoreValue > 0)
-                        {
-                            return rank;
-                        }
-                        else
-                        {
-                            // Score is no longer valid, remove from cache
-                            _rankCache.Remove(customerId);
-                            return null;
-                        }
-                    }
-                    else
-                    {
-                        // Entry no longer exists in cache
-                        return null;
-                    }
-                }
+            long currentVersion = Interlocked.Read(ref _cacheVersion);
 
-                // Cache version hasn't changed, validate score directly
+            // 1. Check cache (now under lock protection)
+            if (_rankCache.TryGetValue(customerId, out int rank))
+            {
+                // Directly validate score while holding the lock
                 if (!_scores.TryGetValue(customerId, out decimal score) || score <= 0)
                 {
-                    // Score is invalid, remove from cache
-                    _rankCache.Remove(customerId);
+                    _rankCache.Remove(customerId);  // Remove invalid entry
                     return null;
                 }
-
-                return rank;
-            }
+                return rank;  
             }
 
-            // Rank not in cache, need to skipList look it up
-            // Double-check cache version hasn't changed
-            long newVersion = Interlocked.Read(ref _cacheVersion);
-            if (newVersion != currentVersion)
-            {
-                // Version has changed, check if rank was added in the meantime
-                if (_rankCache.TryGetValue(customerId, out rank))
-                {
-                    // Verify score is still valid
-                    if (_scores.TryGetValue(customerId, out decimal scoreValue) && scoreValue > 0)
-                    {
-                        return rank;
-                    }
-                    else
-                    {
-                        _rankCache.Remove(customerId);
-                        return null;
-                    }
-                }
-            }
-
-            // Get customer's score from dictionary
-            if (!_scores.TryGetValue(customerId, out decimal score) || score <= 0)
+            // 2. Not in cache - validate score
+            if (!_scores.TryGetValue(customerId, out decimal scoreValue) || scoreValue <= 0)
                 return null;
 
-            // Get rank from leaderboard
-            var customerScore = new CustomerScore(customerId, score);
+            // 3. Fetch rank from leaderboard
+            var customerScore = new CustomerScore(customerId, scoreValue);
             int? result = _leaderboard.GetRank(customerScore);
 
             if (result.HasValue)
             {
-                // Only cache the result if cache version hasn't changed
-                if (Interlocked.Read(ref _cacheVersion) == currentVersion)
+                // Cache with version check
+                if (currentVersion == Interlocked.Read(ref _cacheVersion))
                 {
                     _rankCache[customerId] = result.Value;
                 }
@@ -323,52 +273,9 @@ public class LeaderboardService : ILeaderboardService
         }
         finally
         {
-            _lock.ExitReadLock();
+            _lock.ExitReadLock(); 
         }
-        {
-            // Double-check cache version hasn't changed
-            long newVersion = Interlocked.Read(ref _cacheVersion);
-            if (newVersion != currentVersion)
-            {
-                // Version has changed, check if rank was added in the meantime
-                if (_rankCache.TryGetValue(customerId, out rank))
-                {
-                    // Verify score is still valid
-                    if (_scores.TryGetValue(customerId, out decimal scoreValue) && scoreValue > 0)
-                    {
-                        return rank;
-                    }
-                    else
-                    {
-                        _rankCache.Remove(customerId);
-                        return null;
-                    }
-                }
-            }
 
-            // Get customer's score from dictionary
-            if (!_scores.TryGetValue(customerId, out decimal score) || score <= 0)
-                return null;
-
-            // Get rank from leaderboard
-            var customerScore = new CustomerScore(customerId, score);
-            int? result = _leaderboard.GetRank(customerScore);
-
-            if (result.HasValue)
-            {
-                // Only cache the result if cache version hasn't changed
-                if (Interlocked.Read(ref _cacheVersion) == currentVersion)
-                {
-                    _rankCache[customerId] = result.Value;
-                }
-                return result.Value;
-            }
-            return null;
-        }
-        finally
-        {
-            _lock.ExitReadLock();
-        }
     }
 
     public ServiceMetrics GetMetrics()
