@@ -97,21 +97,33 @@ public class LeaderboardService : ILeaderboardService
             decimal newScore = currentScore + scoreChange;
             _scores[customerId] = newScore;
 
-            // Prepare score objects
-            var oldScoreObj = new CustomerScore(customerId, currentScore);
-            var newScoreObj = new CustomerScore(customerId, newScore);
+            // Flags for leaderboard operations
+            bool shouldRemove = currentScore > 0;  // Only remove if previously valid
+            bool shouldAdd = newScore > 0;         // Only add if new score is valid
+            int? oldRank = null;
+            int? newRank = null;
 
-            // Update skip list
-            if (currentScore > 0)
+            // Update skip list only if required
+            if (shouldRemove || shouldAdd)
             {
-                var (removed, oldRank) = _leaderboard.Remove(oldScoreObj);
-                if (removed) InvalidateCaches(oldRank, customerId);
-            }
+                // Remove previous score from leaderboard if applicable
+                if (shouldRemove)
+                {
+                    var oldScoreObj = new CustomerScore(customerId, currentScore);
+                    var (removed, rank) = _leaderboard.Remove(oldScoreObj);
+                    if (removed) oldRank = rank;
+                }
 
-            if (newScore > 0)
-            {
-                var (added, newRank) = _leaderboard.Add(newScoreObj);
-                if (added) InvalidateCaches(newRank, customerId);
+                // Add new score to leaderboard if applicable
+                if (shouldAdd)
+                {
+                    var newScoreObj = new CustomerScore(customerId, newScore);
+                    var (added, rank) = _leaderboard.Add(newScoreObj);
+                    if (added) newRank = rank;
+                }
+
+                // Consolidated cache invalidation
+                InvalidateCaches(oldRank, newRank, customerId);
             }
 
             return newScore;
@@ -122,15 +134,17 @@ public class LeaderboardService : ILeaderboardService
         }
     }
 
-    private void InvalidateCaches(int affectedRank, long customerId)
+    private void InvalidateCaches(int? oldRank, int? newRank, long customerId)
     {
         _rankCache.Remove(customerId);
-        _topRankCache.RemoveAll(x => x.CustomerId == customerId);
+        if (oldRank.HasValue ||
+            (newRank.HasValue && newRank.Value <= TopRankCacheSize))
+        {
+            _topRankCache.RemoveAll(x => x.CustomerId == customerId);
+        }
         Interlocked.Increment(ref _cacheVersion);
         Interlocked.Increment(ref _topCacheVersion);
-
     }
-
     public List<CustomerRanking> GetByRank(int start, int end)
     {
         if (start < 1 || end < start)
@@ -265,15 +279,52 @@ public class LeaderboardService : ILeaderboardService
 
                 return rank;
             }
-            finally
-            {
-                _lock.ExitReadLock();
             }
-        }
 
-        // Rank not in cache, need to skipList look it up
-        _lock.EnterReadLock();
-        try
+            // Rank not in cache, need to skipList look it up
+            // Double-check cache version hasn't changed
+            long newVersion = Interlocked.Read(ref _cacheVersion);
+            if (newVersion != currentVersion)
+            {
+                // Version has changed, check if rank was added in the meantime
+                if (_rankCache.TryGetValue(customerId, out rank))
+                {
+                    // Verify score is still valid
+                    if (_scores.TryGetValue(customerId, out decimal scoreValue) && scoreValue > 0)
+                    {
+                        return rank;
+                    }
+                    else
+                    {
+                        _rankCache.Remove(customerId);
+                        return null;
+                    }
+                }
+            }
+
+            // Get customer's score from dictionary
+            if (!_scores.TryGetValue(customerId, out decimal score) || score <= 0)
+                return null;
+
+            // Get rank from leaderboard
+            var customerScore = new CustomerScore(customerId, score);
+            int? result = _leaderboard.GetRank(customerScore);
+
+            if (result.HasValue)
+            {
+                // Only cache the result if cache version hasn't changed
+                if (Interlocked.Read(ref _cacheVersion) == currentVersion)
+                {
+                    _rankCache[customerId] = result.Value;
+                }
+                return result.Value;
+            }
+            return null;
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
         {
             // Double-check cache version hasn't changed
             long newVersion = Interlocked.Read(ref _cacheVersion);
